@@ -1,0 +1,96 @@
+# REPO: gemini-agent (central public repo)
+# PATH: .github/workflows/security-agent.yml
+
+name: Security Agent
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      comment_body:
+        required: true
+        type: string
+      comment_author:
+        required: true
+        type: string
+      repo_name:
+        required: true
+        type: string
+      repo_owner:
+        required: true
+        type: string
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+      GH_PAT:
+        required: true
+
+jobs:
+  security-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Fetch PR diff
+        id: diff
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          DIFF=$(curl -s \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${{ inputs.repo_owner }}/${{ inputs.repo_name }}/pulls/${{ inputs.pr_number }}" \
+            | head -c 12000)
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Scan package files for vulnerabilities
+        id: packages
+        run: |
+          PKG_INFO=""
+          if [ -f "package.json" ]; then
+            PKG_INFO="package.json found:\n$(cat package.json | jq '{dependencies, devDependencies}' 2>/dev/null | head -c 3000)"
+          fi
+          if [ -f "requirements.txt" ]; then
+            PKG_INFO="$PKG_INFO\nrequirements.txt found:\n$(cat requirements.txt | head -c 1000)"
+          fi
+          echo "packages<<EOF" >> $GITHUB_OUTPUT
+          echo "$PKG_INFO" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call Gemini Security Scan
+        id: gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          PROMPT="You are a senior application security expert (AppSec). Perform a deep security audit on this PR.\n\nRequested by @${{ inputs.comment_author }}.\n\nAudit for ALL of the following:\n\n🔴 **Critical**\n- SQL Injection\n- XSS (Cross-Site Scripting)\n- CSRF vulnerabilities\n- Exposed secrets, API keys, tokens, passwords in code\n- Remote Code Execution risks\n- Path traversal attacks\n- Insecure deserialization\n\n🟠 **High**\n- Broken authentication & authorization\n- Insecure direct object references (IDOR)\n- Missing input validation & sanitization\n- Insecure HTTP headers\n- JWT vulnerabilities\n- Weak cryptography\n\n🟡 **Medium**\n- Insecure dependencies (check package versions for known CVEs)\n- Outdated packages with known vulnerabilities\n- CORS misconfiguration\n- Sensitive data exposure in logs\n- Missing rate limiting\n\n🔵 **Info**\n- Security best practice violations\n- Missing security headers\n- Overly permissive roles/scopes\n\nFor each finding provide:\n- **Severity**: 🔴 Critical / 🟠 High / 🟡 Medium / 🔵 Info\n- **Location**: file and line if visible\n- **Description**: what the vulnerability is\n- **Impact**: what an attacker could do\n- **Fix**: exact code fix or recommendation\n\nAlso check package versions for known CVEs and outdated vulnerable dependencies.\n\nEnd with overall **Security Score**: 🔴 Unsafe / 🟠 Needs Fixes / 🟡 Minor Issues / ✅ Secure\n\nPackage Info:\n${{ steps.packages.outputs.packages }}\n\nDiff:\n${{ steps.diff.outputs.diff }}"
+
+          PAYLOAD=$(jq -n --arg p "$PROMPT" '{
+            contents: [{parts: [{text: $p}]}],
+            generationConfig: {temperature: 0.1, maxOutputTokens: 2000}
+          }')
+
+          RESPONSE=$(curl -s \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Could not process request."')
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post comment
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          BODY="## 🔒 Security Agent Report\n\n> Responding to @${{ inputs.comment_author }}\n\n${{ steps.gemini.outputs.review }}\n\n---\n*Powered by Gemini 2.0 Flash · Triggered by \`@security-agent\`*"
+          curl -s -X POST \
+            "https://api.github.com/repos/${{ inputs.repo_owner }}/${{ inputs.repo_name }}/issues/${{ inputs.pr_number }}/comments" \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$BODY" '{body: $body}')"
