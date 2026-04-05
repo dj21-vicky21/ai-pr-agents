@@ -1,0 +1,85 @@
+# REPO: gemini-agent (central public repo)
+# PATH: .github/workflows/pr-reviewer-agent.yml
+
+name: PR Reviewer Agent
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      comment_body:
+        required: true
+        type: string
+      comment_author:
+        required: true
+        type: string
+      repo_name:
+        required: true
+        type: string
+      repo_owner:
+        required: true
+        type: string
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+      GH_PAT:
+        required: true
+
+jobs:
+  pr-reviewer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch PR diff
+        id: diff
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          DIFF=$(curl -s \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${{ inputs.repo_owner }}/${{ inputs.repo_name }}/pulls/${{ inputs.pr_number }}" \
+            | head -c 12000)
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Extract message
+        id: msg
+        run: |
+          MSG=$(echo "${{ inputs.comment_body }}" | sed 's/@pr-reviewer//g' | xargs)
+          echo "message=$MSG" >> $GITHUB_OUTPUT
+
+      - name: Call Gemini
+        id: gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          PROMPT="You are a senior code reviewer specializing in React, Next.js, Node.js, Python, HTML, JS, TS, and CSS.\n\nA developer (@${{ inputs.comment_author }}) requested a PR review.\nMessage: ${{ steps.msg.outputs.message }}\n\nProvide a thorough review with:\n1. **Overview** — what this PR does\n2. **Code Quality** — readability, structure, best practices\n3. **Logic Issues** — bugs, wrong assumptions, edge cases\n4. **Performance** — inefficiencies, unnecessary re-renders, heavy operations\n5. **Naming & Conventions** — variables, functions, file structure\n6. **Suggestions** — specific improvements with code examples where helpful\n7. **Verdict** — ✅ Approve / ⚠️ Request Changes / ❌ Major Issues\n\nDiff:\n${{ steps.diff.outputs.diff }}"
+
+          PAYLOAD=$(jq -n --arg p "$PROMPT" '{
+            contents: [{parts: [{text: $p}]}],
+            generationConfig: {temperature: 0.2, maxOutputTokens: 2000}
+          }')
+
+          RESPONSE=$(curl -s \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Could not process request."')
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post comment
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          BODY="## 🔍 PR Reviewer Agent\n\n> Responding to @${{ inputs.comment_author }}\n\n${{ steps.gemini.outputs.review }}\n\n---\n*Powered by Gemini 2.0 Flash · Triggered by \`@pr-reviewer\`*"
+          curl -s -X POST \
+            "https://api.github.com/repos/${{ inputs.repo_owner }}/${{ inputs.repo_name }}/issues/${{ inputs.pr_number }}/comments" \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$BODY" '{body: $body}')"
